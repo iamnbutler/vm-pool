@@ -1,0 +1,450 @@
+//! Shared command and event type definitions for vm-pool.
+//!
+//! This crate defines the protocol used for communication between:
+//! - Host (service) ↔ VM (supervisor) over stdio
+//! - Tasks (client) ↔ vm-pool (service) over Unix socket
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// Strongly-typed VM identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VmId(String);
+
+impl VmId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for VmId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for VmId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for VmId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+/// Commands sent from host to supervisor (inside VM).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VmCommand {
+    /// Execute a shell command.
+    Execute { command: String },
+    /// Graceful shutdown.
+    Shutdown,
+    /// Health check ping.
+    Ping,
+}
+
+/// Events emitted by supervisor to host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VmEvent {
+    /// Supervisor is ready.
+    Ready,
+    /// Command output (stdout/stderr).
+    Output { stream: OutputStream, data: String },
+    /// Command completed.
+    CommandCompleted { exit_code: i32 },
+    /// Pong response to ping.
+    Pong,
+    /// Supervisor is shutting down.
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Stream type for log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+    Supervisor,
+}
+
+/// A single log line with metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogLine {
+    pub stream: LogStream,
+    pub line: String,
+    pub timestamp: u64,
+}
+
+/// Priority level for VM allocation. Higher priority VMs can evict
+/// lower priority ones when the pool is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    /// Background/batch work. First to be evicted.
+    Low = 0,
+    /// Normal interactive work.
+    Normal = 1,
+    /// Urgent work. Can evict Low and Normal.
+    High = 2,
+    /// Critical work. Can evict anything below.
+    Critical = 3,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::Normal
+    }
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Priority::Low => f.write_str("low"),
+            Priority::Normal => f.write_str("normal"),
+            Priority::High => f.write_str("high"),
+            Priority::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+/// Configuration for a VM.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VmConfig {
+    /// CPU cores (default: 2).
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    /// Memory in MB (default: 2048).
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    /// Priority level for pool eviction.
+    #[serde(default)]
+    pub priority: Priority,
+    /// Environment variables to set.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+/// Commands sent from Tasks to vm-pool service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServiceCommand {
+    /// Allocate a new VM from the pool.
+    Allocate { image: String, config: VmConfig },
+    /// Deallocate a VM back to the pool.
+    Deallocate { vm_id: VmId },
+    /// Send a command to a VM.
+    Send { vm_id: VmId, command: VmCommand },
+    /// Save VM state to a snapshot.
+    Snapshot { vm_id: VmId, name: String },
+    /// Restore VM from a snapshot.
+    Restore { vm_id: VmId, snapshot: String },
+    /// Get pool status.
+    Status,
+    /// Get last N log lines from a VM.
+    TailLogs { vm_id: VmId, lines: usize },
+    /// Subscribe to real-time logs from a VM (or all VMs if None).
+    SubscribeLogs { vm_id: Option<VmId> },
+    /// Unsubscribe from log streaming.
+    UnsubscribeLogs,
+}
+
+/// Events emitted by vm-pool service to Tasks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServiceEvent {
+    /// VM was allocated.
+    VmAllocated { vm_id: VmId, image: String },
+    /// VM started and supervisor is ready.
+    VmReady { vm_id: VmId },
+    /// Event forwarded from VM supervisor.
+    VmEvent { vm_id: VmId, event: VmEvent },
+    /// VM stopped (graceful).
+    VmStopped { vm_id: VmId },
+    /// VM crashed or was killed.
+    VmCrashed { vm_id: VmId, error: String },
+    /// Pool status response.
+    PoolStatus {
+        total: usize,
+        available: usize,
+        allocated: usize,
+    },
+    /// Log line from a VM (streamed).
+    VmLog {
+        vm_id: VmId,
+        stream: LogStream,
+        line: String,
+    },
+    /// Response to TailLogs command.
+    LogTail { vm_id: VmId, lines: Vec<LogLine> },
+    /// Acknowledgment of log subscription.
+    LogsSubscribed { vm_id: Option<VmId> },
+    /// An error occurred processing a command.
+    Error { message: String },
+}
+
+/// Encode a value as a JSON line (no embedded newlines, terminated by \n).
+pub fn encode_json_line<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let mut json = serde_json::to_string(value)?;
+    json.push('\n');
+    Ok(json)
+}
+
+/// Decode a JSON line.
+pub fn decode_json_line<'a, T: Deserialize<'a>>(line: &'a str) -> Result<T, serde_json::Error> {
+    serde_json::from_str(line.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_id_display() {
+        let id = VmId::new("vm-abc123");
+        assert_eq!(id.to_string(), "vm-abc123");
+        assert_eq!(id.as_str(), "vm-abc123");
+    }
+
+    #[test]
+    fn vm_id_serde_transparent() {
+        let id = VmId::new("vm-abc123");
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"vm-abc123\"");
+        let parsed: VmId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn vm_id_equality_and_hash() {
+        use std::collections::HashSet;
+        let a = VmId::new("vm-1");
+        let b = VmId::from("vm-1".to_string());
+        let c: VmId = "vm-1".into();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn vm_command_execute_roundtrip() {
+        let cmd = VmCommand::Execute {
+            command: "ls -la".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"execute\""));
+        let parsed: VmCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn vm_command_shutdown_roundtrip() {
+        let cmd = VmCommand::Shutdown;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, "{\"type\":\"shutdown\"}");
+        let parsed: VmCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn vm_command_ping_roundtrip() {
+        let cmd = VmCommand::Ping;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, "{\"type\":\"ping\"}");
+        let parsed: VmCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn vm_event_ready_roundtrip() {
+        let event = VmEvent::Ready;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, "{\"type\":\"ready\"}");
+        let parsed: VmEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn vm_event_output_roundtrip() {
+        let event = VmEvent::Output {
+            stream: OutputStream::Stdout,
+            data: "hello world\n".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: VmEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn vm_event_command_completed_roundtrip() {
+        let event = VmEvent::CommandCompleted { exit_code: 42 };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: VmEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn service_command_allocate_roundtrip() {
+        let cmd = ServiceCommand::Allocate {
+            image: "agent:v1.0.0".into(),
+            config: VmConfig {
+                cpus: Some(2),
+                memory_mb: Some(4096),
+                priority: Priority::High,
+                env: vec![("KEY".into(), "VALUE".into())],
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn service_command_status_roundtrip() {
+        let cmd = ServiceCommand::Status;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, "{\"type\":\"status\"}");
+        let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn service_command_send_roundtrip() {
+        let cmd = ServiceCommand::Send {
+            vm_id: VmId::new("vm-abc"),
+            command: VmCommand::Execute {
+                command: "echo hi".into(),
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn service_event_error_roundtrip() {
+        let event = ServiceEvent::Error {
+            message: "pool exhausted".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn service_event_pool_status_roundtrip() {
+        let event = ServiceEvent::PoolStatus {
+            total: 6,
+            available: 4,
+            allocated: 2,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn service_event_log_tail_roundtrip() {
+        let event = ServiceEvent::LogTail {
+            vm_id: VmId::new("vm-1"),
+            lines: vec![
+                LogLine {
+                    stream: LogStream::Stdout,
+                    line: "output line".into(),
+                    timestamp: 1234567890,
+                },
+                LogLine {
+                    stream: LogStream::Stderr,
+                    line: "error line".into(),
+                    timestamp: 1234567891,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn vm_config_defaults() {
+        let config = VmConfig::default();
+        assert_eq!(config.cpus, None);
+        assert_eq!(config.memory_mb, None);
+        assert!(config.env.is_empty());
+    }
+
+    #[test]
+    fn vm_config_missing_fields_deserialize() {
+        let json = "{}";
+        let config: VmConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config, VmConfig::default());
+    }
+
+    #[test]
+    fn encode_decode_json_line() {
+        let cmd = VmCommand::Ping;
+        let line = encode_json_line(&cmd).unwrap();
+        assert!(line.ends_with('\n'));
+        assert!(!line[..line.len() - 1].contains('\n'));
+        let parsed: VmCommand = decode_json_line(&line).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn log_stream_variants() {
+        let streams = [LogStream::Stdout, LogStream::Stderr, LogStream::Supervisor];
+        for stream in streams {
+            let json = serde_json::to_string(&stream).unwrap();
+            let parsed: LogStream = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, stream);
+        }
+    }
+
+    #[test]
+    fn output_stream_variants() {
+        let streams = [OutputStream::Stdout, OutputStream::Stderr];
+        for stream in streams {
+            let json = serde_json::to_string(&stream).unwrap();
+            let parsed: OutputStream = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, stream);
+        }
+    }
+
+    #[test]
+    fn service_command_subscribe_logs_with_vm_id() {
+        let cmd = ServiceCommand::SubscribeLogs {
+            vm_id: Some(VmId::new("vm-1")),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn service_command_subscribe_logs_all() {
+        let cmd = ServiceCommand::SubscribeLogs { vm_id: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+}

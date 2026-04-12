@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/client",
+    "crates/events",
+    "crates/images",
+    "crates/pool",
+    "crates/protocol",
+    "crates/service",
+    "crates/snapshot",
+    "crates/supervisor",
+    "crates/transport",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/iamnbutler/vm-pool"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Paths
+dirs = "6"
+
+# Testing
+tempfile = "3"
+
+# Internal crates
+vm-pool-client = { path = "crates/client" }
+vm-pool-events = { path = "crates/events" }
+vm-pool-images = { path = "crates/images" }
+vm-pool-manager = { path = "crates/pool" }
+vm-pool-protocol = { path = "crates/protocol" }
+vm-pool-snapshot = { path = "crates/snapshot" }
+vm-pool-transport = { path = "crates/transport" }
