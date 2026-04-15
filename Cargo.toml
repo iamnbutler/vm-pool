@@ -13,10 +13,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/iamnbutler/vm-pool"
+homepage = "https://github.com/iamnbutler/vm-pool"
+keywords = ["vm", "pool", "container", "virtualization"]
+categories = ["virtualization"]
 
 [workspace.dependencies]
 # Async runtime

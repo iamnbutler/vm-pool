@@ -4,6 +4,8 @@ description = "PID 1 process that runs inside VMs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [[bin]]
 name = "supervisor"

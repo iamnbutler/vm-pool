@@ -4,6 +4,8 @@ description = "Main service binary with Unix socket API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 name = "vm_pool_service"
