@@ -21,3 +21,6 @@ Cargo.lock
 
 # Build artifacts
 /images/*/build/
+
+# Worktrees
+.worktrees/
