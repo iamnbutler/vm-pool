@@ -4,6 +4,7 @@ description = "Host-side communication with VMs over stdio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 vm-pool-protocol.workspace = true

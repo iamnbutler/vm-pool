@@ -4,6 +4,7 @@ description = "Append-only event log with pub/sub and log streaming"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 vm-pool-protocol.workspace = true

@@ -4,6 +4,7 @@ description = "Client library for communicating with the vm-pool service"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 vm-pool-protocol.workspace = true

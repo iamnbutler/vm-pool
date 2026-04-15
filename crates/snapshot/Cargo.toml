@@ -4,6 +4,7 @@ description = "Save/restore VM state via Virtualization.framework"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 vm-pool-protocol.workspace = true
