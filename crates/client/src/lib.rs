@@ -1,15 +1,18 @@
 //! Client library for communicating with the vm-pool service.
 //!
 //! Provides a high-level async API over the Unix socket protocol.
+//! The client is generic over an [`AppProtocol`](vm_pool_protocol::AppProtocol)
+//! — specify the protocol that matches the service the client is talking to.
 //!
 //! # Example
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), vm_pool_client::ClientError> {
 //! use vm_pool_client::Client;
-//! use vm_pool_protocol::VmConfig;
+//! use vm_pool_protocol::{NullProtocol, VmConfig};
 //!
-//! let mut client = Client::connect("/tmp/vm-pool.sock").await?;
+//! let mut client: Client<NullProtocol> =
+//!     Client::connect("/tmp/vm-pool.sock").await?;
 //!
 //! let status = client.status().await?;
 //! println!("available: {}", status.available);
@@ -22,16 +25,17 @@
 //! # }
 //! ```
 
+use std::marker::PhantomData;
 use std::path::Path;
 
-use vm_pool_protocol::{
-    LogLine, ServiceCommand, ServiceEvent, VmCommand, VmConfig, VmId,
-};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::debug;
+use vm_pool_protocol::{
+    AppProtocol, LogLine, NullProtocol, ServiceCommand, ServiceEvent, VmConfig, VmId,
+};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -43,8 +47,8 @@ pub enum ClientError {
     Closed,
     #[error("service error: {0}")]
     Service(String),
-    #[error("unexpected response: {0:?}")]
-    UnexpectedResponse(ServiceEvent),
+    #[error("unexpected response: {0}")]
+    UnexpectedResponse(String),
 }
 
 /// Pool status information.
@@ -56,21 +60,22 @@ pub struct PoolStatus {
 }
 
 /// Client for communicating with the vm-pool service.
-pub struct Client {
+pub struct Client<P: AppProtocol = NullProtocol> {
     /// Channel for sending serialized commands to the writer task.
     cmd_tx: mpsc::Sender<String>,
     /// Channel for receiving parsed responses from the reader task.
-    resp_rx: mpsc::Receiver<ServiceEvent>,
+    resp_rx: mpsc::Receiver<ServiceEvent<P>>,
+    _marker: PhantomData<P>,
 }
 
-impl Client {
+impl<P: AppProtocol> Client<P> {
     /// Connect to the vm-pool service at the given Unix socket path.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(path.as_ref()).await?;
         let (reader, writer) = stream.into_split();
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
-        let (resp_tx, resp_rx) = mpsc::channel::<ServiceEvent>(64);
+        let (resp_tx, resp_rx) = mpsc::channel::<ServiceEvent<P>>(64);
 
         // Writer task
         tokio::spawn(async move {
@@ -95,7 +100,9 @@ impl Client {
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        if let Ok(event) = serde_json::from_str::<ServiceEvent>(line.trim()) {
+                        if let Ok(event) =
+                            serde_json::from_str::<ServiceEvent<P>>(line.trim())
+                        {
                             if resp_tx.send(event).await.is_err() {
                                 break;
                             }
@@ -106,11 +113,18 @@ impl Client {
             }
         });
 
-        Ok(Self { cmd_tx, resp_rx })
+        Ok(Self {
+            cmd_tx,
+            resp_rx,
+            _marker: PhantomData,
+        })
     }
 
     /// Send a command and wait for the next response.
-    async fn request(&mut self, command: ServiceCommand) -> Result<ServiceEvent, ClientError> {
+    async fn request(
+        &mut self,
+        command: ServiceCommand<P>,
+    ) -> Result<ServiceEvent<P>, ClientError> {
         let json = serde_json::to_string(&command)?;
         debug!("sending: {}", json);
         self.cmd_tx
@@ -122,7 +136,7 @@ impl Client {
     }
 
     /// Convert a ServiceEvent::Error into a ClientError, or return the event.
-    fn check_error(event: ServiceEvent) -> Result<ServiceEvent, ClientError> {
+    fn check_error(event: ServiceEvent<P>) -> Result<ServiceEvent<P>, ClientError> {
         match event {
             ServiceEvent::Error { message } => Err(ClientError::Service(message)),
             other => Ok(other),
@@ -142,7 +156,7 @@ impl Client {
                 available,
                 allocated,
             }),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
@@ -160,7 +174,7 @@ impl Client {
             .await?;
         match Self::check_error(resp)? {
             ServiceEvent::VmAllocated { vm_id, .. } => Ok(vm_id),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
@@ -173,23 +187,29 @@ impl Client {
             .await?;
         match Self::check_error(resp)? {
             ServiceEvent::VmStopped { .. } => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
-    /// Send a command to a VM.
-    pub async fn send_command(
+    /// Send an application command to a VM.
+    ///
+    /// Returns when the service acks forwarding (CommandSent). The VM's
+    /// application response events arrive asynchronously via `next_event`.
+    pub async fn send_to_vm(
         &mut self,
         vm_id: &VmId,
-        command: VmCommand,
-    ) -> Result<ServiceEvent, ClientError> {
+        command: P::Command,
+    ) -> Result<(), ClientError> {
         let resp = self
             .request(ServiceCommand::Send {
                 vm_id: vm_id.clone(),
                 command,
             })
             .await?;
-        Self::check_error(resp)
+        match Self::check_error(resp)? {
+            ServiceEvent::CommandSent { .. } => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
     }
 
     /// Save a snapshot of a VM.
@@ -202,7 +222,7 @@ impl Client {
             .await?;
         match Self::check_error(resp)? {
             ServiceEvent::VmStopped { .. } => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
@@ -216,7 +236,7 @@ impl Client {
             .await?;
         match Self::check_error(resp)? {
             ServiceEvent::VmReady { .. } => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
@@ -234,7 +254,7 @@ impl Client {
             .await?;
         match Self::check_error(resp)? {
             ServiceEvent::LogTail { lines, .. } => Ok(lines),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
@@ -250,7 +270,7 @@ impl Client {
             .await?;
         match Self::check_error(resp)? {
             ServiceEvent::LogsSubscribed { .. } => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
@@ -259,13 +279,13 @@ impl Client {
         let resp = self.request(ServiceCommand::UnsubscribeLogs).await?;
         match Self::check_error(resp)? {
             ServiceEvent::LogsSubscribed { .. } => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
     /// Receive the next event (for streaming/subscriptions).
     /// Returns None if the connection is closed.
-    pub async fn next_event(&mut self) -> Option<ServiceEvent> {
+    pub async fn next_event(&mut self) -> Option<ServiceEvent<P>> {
         self.resp_rx.recv().await
     }
 }
@@ -274,11 +294,15 @@ impl Client {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use vm_pool_manager::PoolConfig;
+    use vm_pool_manager::{NoRuntime, PoolConfig};
+    use vm_pool_protocol::ShellProtocol;
     use vm_pool_service::{Service, ServiceConfig};
 
+    type TestClient = Client<ShellProtocol>;
+    type TestService = Service<NoRuntime, ShellProtocol>;
+
     /// Start a service on a temp socket and return a connected client.
-    async fn test_client() -> (Client, Arc<Service>, tempfile::TempDir) {
+    async fn test_client() -> (TestClient, Arc<TestService>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
 
@@ -292,7 +316,7 @@ mod tests {
             },
         };
 
-        let service = Service::new(config).await.unwrap();
+        let service = TestService::new(config).await.unwrap();
         let svc = service.clone();
 
         // Run service in background
@@ -306,7 +330,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let client = Client::connect(&socket_path).await.unwrap();
+        let client = Client::<ShellProtocol>::connect(&socket_path).await.unwrap();
         (client, service, dir)
     }
 
@@ -353,7 +377,7 @@ mod tests {
             },
         };
 
-        let service = Service::new(config).await.unwrap();
+        let service = TestService::new(config).await.unwrap();
         let svc = service.clone();
         tokio::spawn(async move { svc.run().await });
 
@@ -364,7 +388,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let mut client = Client::connect(&socket_path).await.unwrap();
+        let mut client = Client::<ShellProtocol>::connect(&socket_path).await.unwrap();
         let result = client.allocate("agent:v1", VmConfig::default()).await;
         assert!(matches!(result, Err(ClientError::Service(_))));
     }
