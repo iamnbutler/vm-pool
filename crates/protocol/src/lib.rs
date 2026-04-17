@@ -94,10 +94,10 @@ pub enum OutputStream {
 /// Zero-sized markers with `#[derive(Debug, Clone, Copy)]` satisfy this.
 pub trait AppProtocol: Send + Sync + Clone + Debug + 'static {
     /// Commands the application sends to processes inside VMs.
-    type Command: Serialize + DeserializeOwned + Send + Clone + Debug + PartialEq + 'static;
+    type Command: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + PartialEq + 'static;
 
     /// Events that processes inside VMs emit back to the application.
-    type Event: Serialize + DeserializeOwned + Send + Clone + Debug + PartialEq + 'static;
+    type Event: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + PartialEq + 'static;
 }
 
 /// No application messages. Used when only infrastructure operations are needed.

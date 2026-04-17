@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use vm_pool_events::{EventLog, EventPayload, VmState};
-use vm_pool_images::ImageRef;
-use vm_pool_protocol::{VmCommand, VmConfig, VmEvent, VmId};
-use vm_pool_transport::{TransportError, VmTransport};
+
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
+use vm_pool_events::{EventLog, EventPayload, InfraEvent, VmState};
+use vm_pool_images::ImageRef;
+use vm_pool_protocol::{AppProtocol, NullProtocol, VmCommand, VmConfig, VmEvent, VmId};
+use vm_pool_transport::{TransportError, VmTransport};
 
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -32,19 +33,19 @@ pub enum PoolError {
 }
 
 /// Handle to a running VM, providing command/event channels.
-pub struct VmHandle {
-    pub command_tx: mpsc::Sender<VmCommand>,
-    pub event_rx: mpsc::Receiver<VmEvent>,
+pub struct VmHandle<P: AppProtocol = NullProtocol> {
+    pub command_tx: mpsc::Sender<VmCommand<P>>,
+    pub event_rx: mpsc::Receiver<VmEvent<P>>,
 }
 
 /// Trait abstracting the VM container backend.
-pub trait VmRuntime: Send + Sync + 'static {
+pub trait VmRuntime<P: AppProtocol = NullProtocol>: Send + Sync + 'static {
     fn start(
         &self,
         vm_id: &VmId,
         image: &ImageRef,
         config: &VmConfig,
-    ) -> impl Future<Output = Result<VmHandle, PoolError>> + Send;
+    ) -> impl Future<Output = Result<VmHandle<P>, PoolError>> + Send;
 
     fn stop(&self, vm_id: &VmId) -> impl Future<Output = Result<(), PoolError>> + Send;
 }
@@ -72,13 +73,13 @@ impl Default for ContainerRuntime {
     }
 }
 
-impl VmRuntime for ContainerRuntime {
+impl<P: AppProtocol> VmRuntime<P> for ContainerRuntime {
     async fn start(
         &self,
         vm_id: &VmId,
         image: &ImageRef,
         config: &VmConfig,
-    ) -> Result<VmHandle, PoolError> {
+    ) -> Result<VmHandle<P>, PoolError> {
         let image_tag = image.to_string();
 
         let cpus = config.cpus.unwrap_or(2).to_string();
@@ -106,7 +107,7 @@ impl VmRuntime for ContainerRuntime {
         info!(%vm_id, ?args, "starting container");
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let mut transport = VmTransport::spawn("container", &args_refs)
+        let mut transport = VmTransport::<P>::spawn("container", &args_refs)
             .await
             .map_err(|e| PoolError::Runtime(format!("failed to spawn container: {e}")))?;
 
@@ -119,7 +120,7 @@ impl VmRuntime for ContainerRuntime {
         .map_err(|_| PoolError::Runtime("timeout waiting for supervisor Ready".into()))?
         .ok_or_else(|| PoolError::Runtime("transport closed before Ready".into()))?;
 
-        if first_event != VmEvent::Ready {
+        if !matches!(first_event, VmEvent::Ready) {
             return Err(PoolError::Runtime(format!(
                 "expected Ready, got {:?}",
                 first_event
@@ -127,8 +128,8 @@ impl VmRuntime for ContainerRuntime {
         }
 
         // Set up command forwarding channels
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VmCommand>(64);
-        let (evt_tx, evt_rx) = mpsc::channel::<VmEvent>(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VmCommand<P>>(64);
+        let (evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(64);
 
         // Bridge task: forward commands to transport, events from transport
         tokio::spawn(async move {
@@ -144,7 +145,7 @@ impl VmRuntime for ContainerRuntime {
                             }
                             None => {
                                 // Command channel closed — shut down
-                                let _ = transport.send(&VmCommand::Shutdown).await;
+                                let _ = transport.send(&VmCommand::<P>::Shutdown).await;
                                 break;
                             }
                         }
@@ -216,18 +217,18 @@ impl SupervisorRuntime {
     }
 }
 
-impl VmRuntime for SupervisorRuntime {
+impl<P: AppProtocol> VmRuntime<P> for SupervisorRuntime {
     async fn start(
         &self,
         vm_id: &VmId,
         _image: &ImageRef,
         _config: &VmConfig,
-    ) -> Result<VmHandle, PoolError> {
+    ) -> Result<VmHandle<P>, PoolError> {
         let path = self.supervisor_path.to_str().ok_or_else(|| {
             PoolError::Runtime("supervisor path is not valid UTF-8".into())
         })?;
 
-        let mut transport = VmTransport::spawn(path, &[])
+        let mut transport = VmTransport::<P>::spawn(path, &[])
             .await
             .map_err(|e| PoolError::Runtime(format!("failed to spawn supervisor: {e}")))?;
 
@@ -237,15 +238,15 @@ impl VmRuntime for SupervisorRuntime {
             .await
             .ok_or_else(|| PoolError::Runtime("transport closed before Ready".into()))?;
 
-        if first_event != VmEvent::Ready {
+        if !matches!(first_event, VmEvent::Ready) {
             return Err(PoolError::Runtime(format!(
                 "expected Ready, got {:?}",
                 first_event
             )));
         }
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VmCommand>(64);
-        let (evt_tx, evt_rx) = mpsc::channel::<VmEvent>(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VmCommand<P>>(64);
+        let (evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(64);
 
         tokio::spawn(async move {
             loop {
@@ -259,7 +260,7 @@ impl VmRuntime for SupervisorRuntime {
                                 }
                             }
                             None => {
-                                let _ = transport.send(&VmCommand::Shutdown).await;
+                                let _ = transport.send(&VmCommand::<P>::Shutdown).await;
                                 break;
                             }
                         }
@@ -312,7 +313,7 @@ impl Default for PoolConfig {
 }
 
 /// State of a VM in the pool.
-struct VmEntry {
+struct VmEntry<P: AppProtocol = NullProtocol> {
     #[allow(dead_code)]
     id: VmId,
     #[allow(dead_code)]
@@ -320,23 +321,23 @@ struct VmEntry {
     config: VmConfig,
     state: VmState,
     started_at: u64,
-    command_tx: Option<mpsc::Sender<VmCommand>>,
+    command_tx: Option<mpsc::Sender<VmCommand<P>>>,
 }
 
 /// Marker type for pools without a runtime.
 pub struct NoRuntime;
 
-/// The VM pool manager, generic over the runtime backend.
-pub struct Pool<R = NoRuntime> {
+/// The VM pool manager, generic over runtime backend and application protocol.
+pub struct Pool<R = NoRuntime, P: AppProtocol = NullProtocol> {
     config: PoolConfig,
-    vms: RwLock<HashMap<VmId, VmEntry>>,
-    events: Arc<EventLog>,
+    vms: RwLock<HashMap<VmId, VmEntry<P>>>,
+    events: Arc<EventLog<P>>,
     runtime: R,
 }
 
-impl Pool<NoRuntime> {
+impl<P: AppProtocol> Pool<NoRuntime, P> {
     /// Create a pool without a runtime (commands to VMs will return VmNotReady).
-    pub fn new(config: PoolConfig, events: Arc<EventLog>) -> Arc<Self> {
+    pub fn new(config: PoolConfig, events: Arc<EventLog<P>>) -> Arc<Self> {
         Arc::new(Self {
             config,
             vms: RwLock::new(HashMap::new()),
@@ -346,8 +347,12 @@ impl Pool<NoRuntime> {
     }
 }
 
-impl<R> Pool<R> {
-    pub fn with_runtime(config: PoolConfig, events: Arc<EventLog>, runtime: R) -> Arc<Self> {
+impl<R, P: AppProtocol> Pool<R, P> {
+    pub fn with_runtime(
+        config: PoolConfig,
+        events: Arc<EventLog<P>>,
+        runtime: R,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             vms: RwLock::new(HashMap::new()),
@@ -375,10 +380,14 @@ impl<R> Pool<R> {
         vms.iter().map(|(id, e)| (id.clone(), e.state)).collect()
     }
 
-    pub async fn send_command(
+    /// Send an application command to a VM.
+    ///
+    /// Infrastructure commands (Ping, Shutdown) are sent internally by the pool
+    /// during lifecycle management — callers only send application messages.
+    pub async fn send_to_vm(
         &self,
         vm_id: &VmId,
-        command: VmCommand,
+        command: P::Command,
     ) -> Result<(), PoolError> {
         let vms = self.vms.read().await;
         let entry = vms
@@ -386,102 +395,45 @@ impl<R> Pool<R> {
             .ok_or_else(|| PoolError::VmNotFound(vm_id.clone()))?;
 
         match &entry.command_tx {
-            Some(tx) => tx.send(command).await.map_err(|_| {
-                PoolError::Runtime(format!("VM {} command channel closed", vm_id))
-            }),
+            Some(tx) => tx
+                .send(VmCommand::App { payload: command })
+                .await
+                .map_err(|_| {
+                    PoolError::Runtime(format!("VM {} command channel closed", vm_id))
+                }),
             None => Err(PoolError::VmNotReady(vm_id.clone())),
         }
     }
 }
 
-// Pool without runtime — no transport channels.
-impl Pool<NoRuntime> {
-    pub async fn allocate(
+// NoRuntime implements VmRuntime as a pool-bookkeeping-only stub: allocations
+// succeed and are tracked in memory, but the returned channels are immediately
+// disconnected, so any subsequent `send_to_vm` fails. Useful for exercising
+// pool allocation/eviction/health-check logic without a real VM backend.
+impl<P: AppProtocol> VmRuntime<P> for NoRuntime {
+    async fn start(
         &self,
-        image: ImageRef,
-        config: VmConfig,
-    ) -> Result<VmId, PoolError> {
-        let mut vms = self.vms.write().await;
-
-        if vms.len() >= self.config.max_vms {
-            return Err(PoolError::Exhausted {
-                available: 0,
-                requested: 1,
-            });
-        }
-
-        let vm_id = generate_vm_id();
-        info!(%vm_id, image = %image, "allocating VM (no runtime)");
-
-        self.events.init_vm(&vm_id).await;
-        self.events
-            .append(EventPayload::VmLifecycle {
-                vm_id: vm_id.clone(),
-                state: VmState::Allocating,
-            })
-            .await;
-
-        let entry = VmEntry {
-            id: vm_id.clone(),
-            image,
-            config,
-            state: VmState::Ready,
-            started_at: now_ms(),
-            command_tx: None,
-        };
-        vms.insert(vm_id.clone(), entry);
-
-        self.events
-            .append(EventPayload::VmLifecycle {
-                vm_id: vm_id.clone(),
-                state: VmState::Ready,
-            })
-            .await;
-
-        Ok(vm_id)
+        _vm_id: &VmId,
+        _image: &ImageRef,
+        _config: &VmConfig,
+    ) -> Result<VmHandle<P>, PoolError> {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<VmCommand<P>>(1);
+        let (_evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(1);
+        // _cmd_rx and _evt_tx drop here: any send on cmd_tx returns Err,
+        // any recv on evt_rx returns None.
+        Ok(VmHandle {
+            command_tx: cmd_tx,
+            event_rx: evt_rx,
+        })
     }
 
-    pub async fn deallocate(&self, vm_id: &VmId) -> Result<(), PoolError> {
-        let mut vms = self.vms.write().await;
-        if vms.remove(vm_id).is_none() {
-            return Err(PoolError::VmNotFound(vm_id.clone()));
-        }
-        info!(%vm_id, "deallocated VM");
-
-        self.events
-            .append(EventPayload::VmLifecycle {
-                vm_id: vm_id.clone(),
-                state: VmState::Stopped,
-            })
-            .await;
-        self.events.cleanup_vm(vm_id).await;
+    async fn stop(&self, _vm_id: &VmId) -> Result<(), PoolError> {
         Ok(())
-    }
-
-    pub async fn health_check(&self) {
-        let mut timed_out = Vec::new();
-        {
-            let vms = self.vms.read().await;
-            for (vm_id, entry) in vms.iter() {
-                let age_ms = now_ms().saturating_sub(entry.started_at);
-                let age_s = age_ms / 1000;
-                if age_ms >= self.config.vm_timeout * 1000 {
-                    warn!(%vm_id, age_s, timeout = self.config.vm_timeout, "VM exceeded timeout");
-                    timed_out.push(vm_id.clone());
-                }
-                debug!(%vm_id, state = ?entry.state, age_s, "health check");
-            }
-        }
-        for vm_id in timed_out {
-            if let Err(e) = self.deallocate(&vm_id).await {
-                warn!(%vm_id, error = %e, "failed to deallocate timed-out VM");
-            }
-        }
     }
 }
 
 // Pool with a real runtime — VMs get transport channels.
-impl<R: VmRuntime> Pool<R> {
+impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
     pub async fn allocate(
         &self,
         image: ImageRef,
@@ -653,18 +605,46 @@ impl<R: VmRuntime> Pool<R> {
     }
 }
 
-async fn forward_vm_events(
+async fn forward_vm_events<P: AppProtocol>(
     vm_id: VmId,
-    mut event_rx: mpsc::Receiver<VmEvent>,
-    events: Arc<EventLog>,
+    mut event_rx: mpsc::Receiver<VmEvent<P>>,
+    events: Arc<EventLog<P>>,
 ) {
     while let Some(event) = event_rx.recv().await {
-        events
-            .append(EventPayload::VmProtocol {
-                vm_id: vm_id.clone(),
-                event,
-            })
-            .await;
+        match event {
+            VmEvent::Ready => {
+                events
+                    .append(EventPayload::VmInfra {
+                        vm_id: vm_id.clone(),
+                        event: InfraEvent::Ready,
+                    })
+                    .await;
+            }
+            VmEvent::Pong => {
+                events
+                    .append(EventPayload::VmInfra {
+                        vm_id: vm_id.clone(),
+                        event: InfraEvent::Pong,
+                    })
+                    .await;
+            }
+            VmEvent::Shutdown => {
+                events
+                    .append(EventPayload::VmInfra {
+                        vm_id: vm_id.clone(),
+                        event: InfraEvent::Shutdown,
+                    })
+                    .await;
+            }
+            VmEvent::App { payload } => {
+                events
+                    .append(EventPayload::VmApp {
+                        vm_id: vm_id.clone(),
+                        event: payload,
+                    })
+                    .await;
+            }
+        }
     }
     debug!(%vm_id, "VM event forwarder stopped");
 }
@@ -699,9 +679,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vm_pool_protocol::{ShellCommand, ShellEvent, ShellProtocol};
 
-    fn test_pool(max_vms: usize) -> Arc<Pool<NoRuntime>> {
-        let events = EventLog::new();
+    fn test_pool(max_vms: usize) -> Arc<Pool<NoRuntime, ShellProtocol>> {
+        let events = EventLog::<ShellProtocol>::new();
         Pool::new(
             PoolConfig {
                 max_vms,
@@ -819,8 +800,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_removes_timed_out() {
-        let events = EventLog::new();
-        let pool = Pool::new(
+        let events = EventLog::<ShellProtocol>::new();
+        let pool: Arc<Pool<NoRuntime, ShellProtocol>> = Pool::new(
             PoolConfig {
                 max_vms: 3,
                 health_check_interval: 1,
@@ -853,24 +834,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_command_no_runtime() {
+    async fn send_to_vm_no_runtime_channel_closed() {
+        // With NoRuntime, allocate succeeds but the returned command_tx is
+        // connected to an immediately-dropped receiver, so sends fail.
         let pool = test_pool(3);
         let vm_id = pool
             .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
             .await
             .unwrap();
-        assert!(matches!(
-            pool.send_command(&vm_id, VmCommand::Ping).await,
-            Err(PoolError::VmNotReady(_))
-        ));
+        let err = pool
+            .send_to_vm(
+                &vm_id,
+                ShellCommand::Execute {
+                    command: "test".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PoolError::Runtime(_)),
+            "expected Runtime, got {err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn send_command_not_found() {
+    async fn send_to_vm_not_found() {
         let pool = test_pool(3);
         assert!(matches!(
-            pool.send_command(&VmId::new("vm-nope"), VmCommand::Ping)
-                .await,
+            pool.send_to_vm(
+                &VmId::new("vm-nope"),
+                ShellCommand::Execute {
+                    command: "test".into(),
+                },
+            )
+            .await,
             Err(PoolError::VmNotFound(_))
         ));
     }
@@ -880,9 +877,9 @@ mod tests {
     #[tokio::test]
     async fn supervisor_runtime_allocate_and_send() {
         let binary = build_supervisor().await;
-        let events = EventLog::new();
+        let events = EventLog::<ShellProtocol>::new();
         let runtime = SupervisorRuntime::new(&binary);
-        let pool = Pool::with_runtime(
+        let pool: Arc<Pool<SupervisorRuntime, ShellProtocol>> = Pool::with_runtime(
             PoolConfig {
                 max_vms: 3,
                 health_check_interval: 300,
@@ -897,8 +894,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Send a ping — it goes to the real supervisor
-        pool.send_command(&vm_id, VmCommand::Ping).await.unwrap();
+        pool.send_to_vm(
+            &vm_id,
+            ShellCommand::Execute {
+                command: "echo hi".into(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Give the event forwarder a moment
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -910,8 +913,8 @@ mod tests {
     #[tokio::test]
     async fn supervisor_runtime_events_forwarded_to_log() {
         let binary = build_supervisor().await;
-        let events = EventLog::new();
-        let pool = Pool::with_runtime(
+        let events = EventLog::<ShellProtocol>::new();
+        let pool: Arc<Pool<SupervisorRuntime, ShellProtocol>> = Pool::with_runtime(
             PoolConfig {
                 max_vms: 3,
                 health_check_interval: 300,
@@ -927,9 +930,9 @@ mod tests {
             .unwrap();
 
         // Execute a command — the supervisor will emit Output + CommandCompleted
-        pool.send_command(
+        pool.send_to_vm(
             &vm_id,
-            VmCommand::Execute {
+            ShellCommand::Execute {
                 command: "echo pool-test".into(),
             },
         )
@@ -940,14 +943,21 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let vm_events = events.for_vm(&vm_id).await;
-        let protocol_events: Vec<_> = vm_events
+        let app_events: Vec<_> = vm_events
             .iter()
-            .filter(|e| matches!(e.payload, EventPayload::VmProtocol { .. }))
+            .filter_map(|e| match &e.payload {
+                EventPayload::VmApp { event, .. } => Some(event.clone()),
+                _ => None,
+            })
             .collect();
+
+        let has_output = app_events.iter().any(|e| matches!(
+            e,
+            ShellEvent::Output { data, .. } if data.contains("pool-test")
+        ));
         assert!(
-            !protocol_events.is_empty(),
-            "expected VM protocol events in log, got {} total events",
-            vm_events.len()
+            has_output,
+            "expected ShellEvent::Output with pool-test, got: {app_events:?}"
         );
 
         pool.deallocate(&vm_id).await.unwrap();
