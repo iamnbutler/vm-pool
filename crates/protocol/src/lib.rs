@@ -44,31 +44,37 @@ impl From<&str> for VmId {
 }
 
 /// Commands sent from host to supervisor (inside VM).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum VmCommand {
-    /// Execute a shell command.
-    Execute { command: String },
-    /// Graceful shutdown.
-    Shutdown,
+#[serde(bound(
+    serialize = "P::Command: Serialize",
+    deserialize = "P::Command: DeserializeOwned",
+))]
+pub enum VmCommand<P: AppProtocol = NullProtocol> {
     /// Health check ping.
     Ping,
+    /// Graceful shutdown.
+    Shutdown,
+    /// Application-defined command (forwarded to child processes inside VM).
+    App { payload: P::Command },
 }
 
 /// Events emitted by supervisor to host.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum VmEvent {
+#[serde(bound(
+    serialize = "P::Event: Serialize",
+    deserialize = "P::Event: DeserializeOwned",
+))]
+pub enum VmEvent<P: AppProtocol = NullProtocol> {
     /// Supervisor is ready.
     Ready,
-    /// Command output (stdout/stderr).
-    Output { stream: OutputStream, data: String },
-    /// Command completed.
-    CommandCompleted { exit_code: i32 },
     /// Pong response to ping.
     Pong,
     /// Supervisor is shutting down.
     Shutdown,
+    /// Application-defined event (emitted by child processes inside VM).
+    App { payload: P::Event },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +97,7 @@ pub trait AppProtocol: Send + Sync + 'static {
 }
 
 /// No application messages. Used when only infrastructure operations are needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NullProtocol;
 
 impl AppProtocol for NullProtocol {
@@ -108,6 +115,7 @@ pub enum NullEvent {}
 
 /// Built-in protocol for shell command execution.
 /// Equivalent to the original hardcoded Execute/Output/CommandCompleted behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShellProtocol;
 
 impl AppProtocol for ShellProtocol {
@@ -303,19 +311,8 @@ mod tests {
     }
 
     #[test]
-    fn vm_command_execute_roundtrip() {
-        let cmd = VmCommand::Execute {
-            command: "ls -la".into(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"execute\""));
-        let parsed: VmCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-    }
-
-    #[test]
     fn vm_command_shutdown_roundtrip() {
-        let cmd = VmCommand::Shutdown;
+        let cmd: VmCommand = VmCommand::Shutdown;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, "{\"type\":\"shutdown\"}");
         let parsed: VmCommand = serde_json::from_str(&json).unwrap();
@@ -324,7 +321,7 @@ mod tests {
 
     #[test]
     fn vm_command_ping_roundtrip() {
-        let cmd = VmCommand::Ping;
+        let cmd: VmCommand = VmCommand::Ping;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, "{\"type\":\"ping\"}");
         let parsed: VmCommand = serde_json::from_str(&json).unwrap();
@@ -333,28 +330,9 @@ mod tests {
 
     #[test]
     fn vm_event_ready_roundtrip() {
-        let event = VmEvent::Ready;
+        let event: VmEvent = VmEvent::Ready;
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(json, "{\"type\":\"ready\"}");
-        let parsed: VmEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn vm_event_output_roundtrip() {
-        let event = VmEvent::Output {
-            stream: OutputStream::Stdout,
-            data: "hello world\n".into(),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let parsed: VmEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn vm_event_command_completed_roundtrip() {
-        let event = VmEvent::CommandCompleted { exit_code: 42 };
-        let json = serde_json::to_string(&event).unwrap();
         let parsed: VmEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
     }
@@ -380,19 +358,6 @@ mod tests {
         let cmd = ServiceCommand::Status;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, "{\"type\":\"status\"}");
-        let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-    }
-
-    #[test]
-    fn service_command_send_roundtrip() {
-        let cmd = ServiceCommand::Send {
-            vm_id: VmId::new("vm-abc"),
-            command: VmCommand::Execute {
-                command: "echo hi".into(),
-            },
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
         let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cmd);
     }
@@ -459,7 +424,7 @@ mod tests {
 
     #[test]
     fn encode_decode_json_line() {
-        let cmd = VmCommand::Ping;
+        let cmd: VmCommand = VmCommand::Ping;
         let line = encode_json_line(&cmd).unwrap();
         assert!(line.ends_with('\n'));
         assert!(!line[..line.len() - 1].contains('\n'));
@@ -532,6 +497,50 @@ mod tests {
         let event = ShellEvent::CommandCompleted { exit_code: 42 };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ShellEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn vm_command_app_shell_roundtrip() {
+        let cmd: VmCommand<ShellProtocol> = VmCommand::App {
+            payload: ShellCommand::Execute {
+                command: "ls".into(),
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"app\""));
+        let parsed: VmCommand<ShellProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn vm_event_app_shell_roundtrip() {
+        let event: VmEvent<ShellProtocol> = VmEvent::App {
+            payload: ShellEvent::Output {
+                stream: OutputStream::Stdout,
+                data: "hello\n".into(),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: VmEvent<ShellProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn vm_command_infra_with_null_protocol() {
+        let cmd: VmCommand<NullProtocol> = VmCommand::Ping;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, "{\"type\":\"ping\"}");
+        let parsed: VmCommand<NullProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn vm_event_infra_with_null_protocol() {
+        let event: VmEvent<NullProtocol> = VmEvent::Ready;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, "{\"type\":\"ready\"}");
+        let parsed: VmEvent<NullProtocol> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
     }
 }
