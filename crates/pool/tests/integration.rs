@@ -9,7 +9,7 @@ use std::sync::Arc;
 use vm_pool_events::{EventLog, EventPayload, VmState};
 use vm_pool_images::ImageRef;
 use vm_pool_manager::{Pool, PoolConfig, SupervisorRuntime};
-use vm_pool_protocol::{Priority, VmCommand, VmConfig};
+use vm_pool_protocol::{Priority, ShellCommand, ShellEvent, ShellProtocol, VmConfig};
 
 /// Build the supervisor and return its path.
 async fn build_supervisor() -> PathBuf {
@@ -39,8 +39,8 @@ async fn build_supervisor() -> PathBuf {
 fn make_pool(
     binary: &PathBuf,
     max_vms: usize,
-    events: Arc<EventLog>,
-) -> Arc<Pool<SupervisorRuntime>> {
+    events: Arc<EventLog<ShellProtocol>>,
+) -> Arc<Pool<SupervisorRuntime, ShellProtocol>> {
     Pool::with_runtime(
         PoolConfig {
             max_vms,
@@ -63,7 +63,7 @@ fn config_with_priority(priority: Priority) -> VmConfig {
 #[tokio::test]
 async fn allocate_execute_and_verify_events() {
     let binary = build_supervisor().await;
-    let events = EventLog::new();
+    let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 3, events.clone());
 
     // Allocate a VM
@@ -73,9 +73,9 @@ async fn allocate_execute_and_verify_events() {
         .unwrap();
 
     // Execute a command
-    pool.send_command(
+    pool.send_to_vm(
         &vm_id,
-        VmCommand::Execute {
+        ShellCommand::Execute {
             command: "echo integration-test-output".into(),
         },
     )
@@ -88,7 +88,7 @@ async fn allocate_execute_and_verify_events() {
     // Verify events in the log
     let vm_events = events.for_vm(&vm_id).await;
 
-    // Should have lifecycle events (Allocating, Ready) + protocol events (Output, CommandCompleted)
+    // Should have lifecycle events (Allocating, Ready) + application events (Output, CommandCompleted)
     let lifecycle_events: Vec<_> = vm_events
         .iter()
         .filter_map(|e| match &e.payload {
@@ -105,38 +105,37 @@ async fn allocate_execute_and_verify_events() {
         "missing Ready event"
     );
 
-    let protocol_events: Vec<_> = vm_events
+    let app_events: Vec<_> = vm_events
         .iter()
         .filter_map(|e| match &e.payload {
-            EventPayload::VmProtocol { event, .. } => Some(event.clone()),
+            EventPayload::VmApp { event, .. } => Some(event.clone()),
             _ => None,
         })
         .collect();
     assert!(
-        !protocol_events.is_empty(),
-        "expected protocol events from Execute command"
+        !app_events.is_empty(),
+        "expected app events from Execute command"
     );
 
     // Verify the actual output contains our marker
-    let has_output = protocol_events.iter().any(|e| match e {
-        vm_pool_protocol::VmEvent::Output { data, .. } => {
-            data.contains("integration-test-output")
-        }
+    let has_output = app_events.iter().any(|e| match e {
+        ShellEvent::Output { data, .. } => data.contains("integration-test-output"),
         _ => false,
     });
-    assert!(has_output, "expected output containing 'integration-test-output', got: {:?}", protocol_events);
+    assert!(
+        has_output,
+        "expected output containing 'integration-test-output', got: {:?}",
+        app_events
+    );
 
     // Verify CommandCompleted with exit code 0
-    let has_completed = protocol_events.iter().any(|e| {
-        matches!(
-            e,
-            vm_pool_protocol::VmEvent::CommandCompleted { exit_code: 0 }
-        )
-    });
+    let has_completed = app_events
+        .iter()
+        .any(|e| matches!(e, ShellEvent::CommandCompleted { exit_code: 0 }));
     assert!(
         has_completed,
         "expected CommandCompleted with exit_code 0, got: {:?}",
-        protocol_events
+        app_events
     );
 
     // Deallocate
@@ -148,7 +147,7 @@ async fn allocate_execute_and_verify_events() {
 #[tokio::test]
 async fn priority_eviction() {
     let binary = build_supervisor().await;
-    let events = EventLog::new();
+    let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 2, events.clone());
 
     // Fill the pool with low-priority VMs
@@ -226,7 +225,7 @@ async fn priority_eviction() {
 #[tokio::test]
 async fn no_eviction_when_all_same_priority() {
     let binary = build_supervisor().await;
-    let events = EventLog::new();
+    let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 1, events);
 
     pool.allocate(
@@ -254,7 +253,7 @@ async fn no_eviction_when_all_same_priority() {
 #[tokio::test]
 async fn full_lifecycle_with_multiple_commands() {
     let binary = build_supervisor().await;
-    let events = EventLog::new();
+    let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 3, events.clone());
 
     let vm_id = pool
@@ -264,9 +263,9 @@ async fn full_lifecycle_with_multiple_commands() {
 
     // Execute several commands
     for i in 0..3 {
-        pool.send_command(
+        pool.send_to_vm(
             &vm_id,
-            VmCommand::Execute {
+            ShellCommand::Execute {
                 command: format!("echo cmd-{}", i),
             },
         )
@@ -275,9 +274,9 @@ async fn full_lifecycle_with_multiple_commands() {
     }
 
     // Execute a failing command
-    pool.send_command(
+    pool.send_to_vm(
         &vm_id,
-        VmCommand::Execute {
+        ShellCommand::Execute {
             command: "exit 7".into(),
         },
     )
@@ -288,19 +287,19 @@ async fn full_lifecycle_with_multiple_commands() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let vm_events = events.for_vm(&vm_id).await;
-    let protocol_events: Vec<_> = vm_events
+    let app_events: Vec<_> = vm_events
         .iter()
         .filter_map(|e| match &e.payload {
-            EventPayload::VmProtocol { event, .. } => Some(event.clone()),
+            EventPayload::VmApp { event, .. } => Some(event.clone()),
             _ => None,
         })
         .collect();
 
     // Count CommandCompleted events
-    let completed: Vec<_> = protocol_events
+    let completed: Vec<_> = app_events
         .iter()
         .filter_map(|e| match e {
-            vm_pool_protocol::VmEvent::CommandCompleted { exit_code } => Some(*exit_code),
+            ShellEvent::CommandCompleted { exit_code } => Some(*exit_code),
             _ => None,
         })
         .collect();
@@ -344,7 +343,7 @@ async fn full_lifecycle_with_multiple_commands() {
 #[tokio::test]
 async fn concurrent_vms() {
     let binary = build_supervisor().await;
-    let events = EventLog::new();
+    let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 3, events.clone());
 
     // Allocate 3 VMs
@@ -361,9 +360,9 @@ async fn concurrent_vms() {
 
     // Send a unique command to each VM
     for (i, vm_id) in vm_ids.iter().enumerate() {
-        pool.send_command(
+        pool.send_to_vm(
             vm_id,
-            VmCommand::Execute {
+            ShellCommand::Execute {
                 command: format!("echo vm-{}-output", i),
             },
         )
@@ -377,8 +376,8 @@ async fn concurrent_vms() {
     for (i, vm_id) in vm_ids.iter().enumerate() {
         let vm_events = events.for_vm(vm_id).await;
         let has_output = vm_events.iter().any(|e| match &e.payload {
-            EventPayload::VmProtocol {
-                event: vm_pool_protocol::VmEvent::Output { data, .. },
+            EventPayload::VmApp {
+                event: ShellEvent::Output { data, .. },
                 ..
             } => data.contains(&format!("vm-{}-output", i)),
             _ => false,
