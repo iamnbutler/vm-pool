@@ -8,13 +8,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use vm_pool_protocol::{LogStream, VmId};
 use tokio::sync::{broadcast, RwLock};
 use tracing::debug;
+use vm_pool_protocol::{AppProtocol, LogStream, NullProtocol, VmId};
 
 /// A timestamped, sequenced event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
+#[serde(bound(
+    serialize = "P::Event: Serialize",
+    deserialize = "P::Event: serde::de::DeserializeOwned",
+))]
+pub struct Event<P: AppProtocol = NullProtocol> {
     /// Monotonic sequence number.
     pub seq: u64,
     /// Unix timestamp (ms).
@@ -22,13 +26,26 @@ pub struct Event {
     /// Source VM ID (if from a VM).
     pub vm_id: Option<VmId>,
     /// Event payload.
-    pub payload: EventPayload,
+    pub payload: EventPayload<P>,
+}
+
+/// Infrastructure events that vm-pool handles internally (non-application).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InfraEvent {
+    Ready,
+    Pong,
+    Shutdown,
 }
 
 /// Event payload types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum EventPayload {
+#[serde(bound(
+    serialize = "P::Event: Serialize",
+    deserialize = "P::Event: serde::de::DeserializeOwned",
+))]
+pub enum EventPayload<P: AppProtocol = NullProtocol> {
     /// VM lifecycle event.
     VmLifecycle { vm_id: VmId, state: VmState },
     /// Log line from a VM.
@@ -37,24 +54,24 @@ pub enum EventPayload {
         stream: LogStream,
         line: String,
     },
-    /// VM command/event (forwarded from protocol).
-    VmProtocol {
-        vm_id: VmId,
-        event: vm_pool_protocol::VmEvent,
-    },
+    /// VM infrastructure event (Ready, Pong, Shutdown).
+    VmInfra { vm_id: VmId, event: InfraEvent },
+    /// Application event from a VM.
+    VmApp { vm_id: VmId, event: P::Event },
     /// Pool state change.
     PoolState { total: usize, available: usize },
     /// Service lifecycle.
     Service { state: ServiceState },
 }
 
-impl EventPayload {
+impl<P: AppProtocol> EventPayload<P> {
     /// Extract the VM ID from this payload, if it has one.
     pub fn vm_id(&self) -> Option<&VmId> {
         match self {
             EventPayload::VmLifecycle { vm_id, .. }
             | EventPayload::VmLog { vm_id, .. }
-            | EventPayload::VmProtocol { vm_id, .. } => Some(vm_id),
+            | EventPayload::VmInfra { vm_id, .. }
+            | EventPayload::VmApp { vm_id, .. } => Some(vm_id),
             EventPayload::PoolState { .. } | EventPayload::Service { .. } => None,
         }
     }
@@ -129,14 +146,14 @@ impl VmLogBuffer {
 }
 
 /// Event log with append-only storage and pub/sub.
-pub struct EventLog {
-    events: RwLock<Vec<Event>>,
+pub struct EventLog<P: AppProtocol = NullProtocol> {
+    events: RwLock<Vec<Event<P>>>,
     next_seq: RwLock<u64>,
-    broadcast: broadcast::Sender<Event>,
+    broadcast: broadcast::Sender<Event<P>>,
     vm_logs: RwLock<HashMap<VmId, VmLogBuffer>>,
 }
 
-impl EventLog {
+impl<P: AppProtocol> EventLog<P> {
     pub fn new() -> Arc<Self> {
         let (broadcast, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -148,7 +165,7 @@ impl EventLog {
     }
 
     /// Append an event to the log.
-    pub async fn append(&self, payload: EventPayload) -> Event {
+    pub async fn append(&self, payload: EventPayload<P>) -> Event<P> {
         let mut seq = self.next_seq.write().await;
         let timestamp = now_ms();
         let vm_id = payload.vm_id().cloned();
@@ -184,18 +201,18 @@ impl EventLog {
     }
 
     /// Subscribe to real-time events.
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Event<P>> {
         self.broadcast.subscribe()
     }
 
     /// Get events since a sequence number.
-    pub async fn since(&self, seq: u64) -> Vec<Event> {
+    pub async fn since(&self, seq: u64) -> Vec<Event<P>> {
         let events = self.events.read().await;
         events.iter().filter(|e| e.seq >= seq).cloned().collect()
     }
 
     /// Get events for a specific VM.
-    pub async fn for_vm(&self, vm_id: &VmId) -> Vec<Event> {
+    pub async fn for_vm(&self, vm_id: &VmId) -> Vec<Event<P>> {
         let events = self.events.read().await;
         events
             .iter()
@@ -309,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_log_append_and_query() {
-        let log = EventLog::new();
+        let log = EventLog::<NullProtocol>::new();
         let vm_id = VmId::new("vm-1");
 
         let e1 = log
@@ -334,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_log_since() {
-        let log = EventLog::new();
+        let log = EventLog::<NullProtocol>::new();
         let vm_id = VmId::new("vm-1");
 
         for _ in 0..5 {
@@ -353,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_log_for_vm() {
-        let log = EventLog::new();
+        let log = EventLog::<NullProtocol>::new();
         let vm1 = VmId::new("vm-1");
         let vm2 = VmId::new("vm-2");
 
@@ -382,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_log_vm_log_tailing() {
-        let log = EventLog::new();
+        let log = EventLog::<NullProtocol>::new();
         let vm_id = VmId::new("vm-1");
         log.init_vm(&vm_id).await;
 
@@ -404,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_log_cleanup_vm() {
-        let log = EventLog::new();
+        let log = EventLog::<NullProtocol>::new();
         let vm_id = VmId::new("vm-1");
         log.init_vm(&vm_id).await;
 
@@ -425,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_log_subscribe() {
-        let log = EventLog::new();
+        let log = EventLog::<NullProtocol>::new();
         let mut rx = log.subscribe();
 
         let vm_id = VmId::new("vm-1");
@@ -444,18 +461,24 @@ mod tests {
     fn event_payload_vm_id_extraction() {
         let vm_id = VmId::new("vm-1");
 
-        let payload = EventPayload::VmLifecycle {
+        let payload: EventPayload = EventPayload::VmLifecycle {
             vm_id: vm_id.clone(),
             state: VmState::Ready,
         };
         assert_eq!(payload.vm_id(), Some(&vm_id));
 
-        let payload = EventPayload::Service {
+        let payload: EventPayload = EventPayload::VmInfra {
+            vm_id: vm_id.clone(),
+            event: InfraEvent::Ready,
+        };
+        assert_eq!(payload.vm_id(), Some(&vm_id));
+
+        let payload: EventPayload = EventPayload::Service {
             state: ServiceState::Ready,
         };
         assert_eq!(payload.vm_id(), None);
 
-        let payload = EventPayload::PoolState {
+        let payload: EventPayload = EventPayload::PoolState {
             total: 6,
             available: 4,
         };

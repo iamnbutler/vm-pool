@@ -88,7 +88,11 @@ pub enum OutputStream {
 ///
 /// vm-pool handles infrastructure messages (ping, shutdown, health, allocation).
 /// The application defines everything else via this trait.
-pub trait AppProtocol: Send + Sync + 'static {
+///
+/// Implementors must be `Clone + Debug` themselves so generic derives on
+/// `VmCommand<P>` / `VmEvent<P>` / `Event<P>` can add the bounds they need.
+/// Zero-sized markers with `#[derive(Debug, Clone, Copy)]` satisfy this.
+pub trait AppProtocol: Send + Sync + Clone + Debug + 'static {
     /// Commands the application sends to processes inside VMs.
     type Command: Serialize + DeserializeOwned + Send + Clone + Debug + PartialEq + 'static;
 
