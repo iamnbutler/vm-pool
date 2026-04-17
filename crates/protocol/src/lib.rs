@@ -208,15 +208,19 @@ pub struct VmConfig {
 }
 
 /// Commands sent from Tasks to vm-pool service.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServiceCommand {
+#[serde(bound(
+    serialize = "P::Command: Serialize",
+    deserialize = "P::Command: DeserializeOwned",
+))]
+pub enum ServiceCommand<P: AppProtocol = NullProtocol> {
     /// Allocate a new VM from the pool.
     Allocate { image: String, config: VmConfig },
     /// Deallocate a VM back to the pool.
     Deallocate { vm_id: VmId },
-    /// Send a command to a VM.
-    Send { vm_id: VmId, command: VmCommand },
+    /// Send an application command to a VM.
+    Send { vm_id: VmId, command: P::Command },
     /// Save VM state to a snapshot.
     Snapshot { vm_id: VmId, name: String },
     /// Restore VM from a snapshot.
@@ -232,15 +236,17 @@ pub enum ServiceCommand {
 }
 
 /// Events emitted by vm-pool service to Tasks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServiceEvent {
+#[serde(bound(
+    serialize = "P::Event: Serialize",
+    deserialize = "P::Event: DeserializeOwned",
+))]
+pub enum ServiceEvent<P: AppProtocol = NullProtocol> {
     /// VM was allocated.
     VmAllocated { vm_id: VmId, image: String },
     /// VM started and supervisor is ready.
     VmReady { vm_id: VmId },
-    /// Event forwarded from VM supervisor.
-    VmEvent { vm_id: VmId, event: VmEvent },
     /// VM stopped (graceful).
     VmStopped { vm_id: VmId },
     /// VM crashed or was killed.
@@ -263,6 +269,10 @@ pub enum ServiceEvent {
     LogsSubscribed { vm_id: Option<VmId> },
     /// An error occurred processing a command.
     Error { message: String },
+    /// Acknowledgment that an application command was forwarded to a VM.
+    CommandSent { vm_id: VmId },
+    /// Application event forwarded from a VM.
+    VmApp { vm_id: VmId, event: P::Event },
 }
 
 /// Encode a value as a JSON line (no embedded newlines, terminated by \n).
@@ -339,7 +349,7 @@ mod tests {
 
     #[test]
     fn service_command_allocate_roundtrip() {
-        let cmd = ServiceCommand::Allocate {
+        let cmd: ServiceCommand = ServiceCommand::Allocate {
             image: "agent:v1.0.0".into(),
             config: VmConfig {
                 cpus: Some(2),
@@ -355,7 +365,7 @@ mod tests {
 
     #[test]
     fn service_command_status_roundtrip() {
-        let cmd = ServiceCommand::Status;
+        let cmd: ServiceCommand = ServiceCommand::Status;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, "{\"type\":\"status\"}");
         let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
@@ -363,8 +373,35 @@ mod tests {
     }
 
     #[test]
+    fn service_command_send_shell_roundtrip() {
+        let cmd: ServiceCommand<ShellProtocol> = ServiceCommand::Send {
+            vm_id: VmId::new("vm-abc"),
+            command: ShellCommand::Execute {
+                command: "echo hi".into(),
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: ServiceCommand<ShellProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn service_event_vm_app_roundtrip() {
+        let event: ServiceEvent<ShellProtocol> = ServiceEvent::VmApp {
+            vm_id: VmId::new("vm-abc"),
+            event: ShellEvent::Output {
+                stream: OutputStream::Stdout,
+                data: "hello\n".into(),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServiceEvent<ShellProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
     fn service_event_error_roundtrip() {
-        let event = ServiceEvent::Error {
+        let event: ServiceEvent = ServiceEvent::Error {
             message: "pool exhausted".into(),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -375,7 +412,7 @@ mod tests {
 
     #[test]
     fn service_event_pool_status_roundtrip() {
-        let event = ServiceEvent::PoolStatus {
+        let event: ServiceEvent = ServiceEvent::PoolStatus {
             total: 6,
             available: 4,
             allocated: 2,
@@ -387,7 +424,7 @@ mod tests {
 
     #[test]
     fn service_event_log_tail_roundtrip() {
-        let event = ServiceEvent::LogTail {
+        let event: ServiceEvent = ServiceEvent::LogTail {
             vm_id: VmId::new("vm-1"),
             lines: vec![
                 LogLine {
@@ -454,7 +491,7 @@ mod tests {
 
     #[test]
     fn service_command_subscribe_logs_with_vm_id() {
-        let cmd = ServiceCommand::SubscribeLogs {
+        let cmd: ServiceCommand = ServiceCommand::SubscribeLogs {
             vm_id: Some(VmId::new("vm-1")),
         };
         let json = serde_json::to_string(&cmd).unwrap();
@@ -464,7 +501,7 @@ mod tests {
 
     #[test]
     fn service_command_subscribe_logs_all() {
-        let cmd = ServiceCommand::SubscribeLogs { vm_id: None };
+        let cmd: ServiceCommand = ServiceCommand::SubscribeLogs { vm_id: None };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cmd);
