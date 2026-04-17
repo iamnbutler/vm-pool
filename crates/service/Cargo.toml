@@ -18,9 +18,6 @@ path = "src/main.rs"
 [dependencies]
 vm-pool-protocol.workspace = true
 vm-pool-manager.workspace = true
-vm-pool-images.workspace = true
-vm-pool-snapshot.workspace = true
-vm-pool-events.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

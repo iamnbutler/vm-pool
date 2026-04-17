@@ -7,9 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use vm_pool_protocol::VmId;
 use thiserror::Error;
 use tracing::info;
+use vm_pool_protocol::VmId;
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {

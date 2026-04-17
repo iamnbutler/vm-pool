@@ -4,6 +4,16 @@
 //! abstracts the container backend. [`ContainerRuntime`] provides the
 //! real implementation using apple/container.
 
+pub mod events;
+pub mod images;
+pub mod snapshot;
+pub mod transport;
+
+pub use events::{Event, EventLog, EventPayload, InfraEvent, ServiceState, VmState};
+pub use images::{ImageError, ImageMetadata, ImageRef, ImageStore, ImageType};
+pub use snapshot::{SnapshotError, SnapshotMetadata, SnapshotStore};
+pub use transport::{TransportError, VmTransport, find_supervisor_binary};
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -11,10 +21,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
-use vm_pool_events::{EventLog, EventPayload, InfraEvent, VmState};
-use vm_pool_images::ImageRef;
 use vm_pool_protocol::{AppProtocol, NullProtocol, VmCommand, VmConfig, VmEvent, VmId};
-use vm_pool_transport::{TransportError, VmTransport};
 
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -25,7 +32,7 @@ pub enum PoolError {
     #[error("VM not ready: {0}")]
     VmNotReady(VmId),
     #[error("image error: {0}")]
-    Image(#[from] vm_pool_images::ImageError),
+    Image(#[from] ImageError),
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
     #[error("runtime error: {0}")]
