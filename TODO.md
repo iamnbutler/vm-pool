@@ -20,16 +20,23 @@ vm-pool is pure infrastructure. It manages VMs, pools, priorities, health, and p
 - [ ] `cargo publish --dry-run` each crate
 - [ ] Publish to crates.io
 
-## Generic protocol
+## Generic protocol ✅
 
-The current protocol hardcodes `VmCommand::Execute` and `VmEvent::Output` — this leaks assumptions about what runs inside VMs.
+Protocol is now generic over an `AppProtocol` trait. vm-pool handles
+infrastructure messages (Ping/Pong/Shutdown/Ready); applications define
+their own command/event vocabulary via `AppProtocol::Command` and
+`AppProtocol::Event`. Built-ins: `NullProtocol` (no app messages) and
+`ShellProtocol` (the original shell-execution behavior, preserved as an
+opt-in).
 
-- [ ] Split protocol into pool-level commands (fixed) and VM-passthrough commands (generic)
+- [x] Split protocol into pool-level commands (fixed) and VM-passthrough commands (generic)
   - Pool commands: `Allocate`, `Deallocate`, `Status`, `Snapshot`, `Restore`, `TailLogs`, `SubscribeLogs`
-  - Passthrough: `Send { vm_id, payload: T }` where T is application-defined (`Serialize + DeserializeOwned`)
-- [ ] Make `Pool<R, C, E>` generic over runtime `R`, command type `C`, and event type `E`
-- [ ] Transport becomes generic over the message types it frames
-- [ ] Supervisor protocol split: infrastructure messages (ping/pong, shutdown, health) vs application messages (opaque forwarding)
+  - Passthrough: `Send { vm_id, command: P::Command }` where `P: AppProtocol`
+- [x] Make `Pool<R, P>` generic over runtime `R` and `P: AppProtocol` (threading `P::Command` / `P::Event` throughout)
+- [x] `VmTransport<P>` framing generic over the protocol's command/event types
+- [x] Supervisor becomes a library + binary. `run_supervisor<P, H, Fut>` handles infra messages; the binary specializes with `ShellProtocol`.
+
+See: `docs/superpowers/specs/2026-04-15-generic-protocol-design.md` and `docs/superpowers/plans/2026-04-15-generic-protocol.md`.
 
 ## Supervisor rework
 
