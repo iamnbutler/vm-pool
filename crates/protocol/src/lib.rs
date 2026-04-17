@@ -5,7 +5,9 @@
 //! - Tasks (client) ↔ vm-pool (service) over Unix socket
 
 use std::fmt;
+use std::fmt::Debug;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Strongly-typed VM identifier.
@@ -74,6 +76,61 @@ pub enum VmEvent {
 pub enum OutputStream {
     Stdout,
     Stderr,
+}
+
+/// Defines application-specific command and event types that flow through VMs.
+///
+/// vm-pool handles infrastructure messages (ping, shutdown, health, allocation).
+/// The application defines everything else via this trait.
+pub trait AppProtocol: Send + Sync + 'static {
+    /// Commands the application sends to processes inside VMs.
+    type Command: Serialize + DeserializeOwned + Send + Clone + Debug + PartialEq + 'static;
+
+    /// Events that processes inside VMs emit back to the application.
+    type Event: Serialize + DeserializeOwned + Send + Clone + Debug + PartialEq + 'static;
+}
+
+/// No application messages. Used when only infrastructure operations are needed.
+pub struct NullProtocol;
+
+impl AppProtocol for NullProtocol {
+    type Command = NullCommand;
+    type Event = NullEvent;
+}
+
+/// Uninhabited command type — can never be constructed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NullCommand {}
+
+/// Uninhabited event type — can never be constructed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NullEvent {}
+
+/// Built-in protocol for shell command execution.
+/// Equivalent to the original hardcoded Execute/Output/CommandCompleted behavior.
+pub struct ShellProtocol;
+
+impl AppProtocol for ShellProtocol {
+    type Command = ShellCommand;
+    type Event = ShellEvent;
+}
+
+/// Shell command — execute a shell command inside the VM.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellCommand {
+    /// Execute a shell command via `sh -c`.
+    Execute { command: String },
+}
+
+/// Shell event — output from a shell command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellEvent {
+    /// Command output (stdout/stderr).
+    Output { stream: OutputStream, data: String },
+    /// Command completed with exit code.
+    CommandCompleted { exit_code: i32 },
 }
 
 /// Stream type for log output.
@@ -446,5 +503,35 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: ServiceCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn shell_command_execute_roundtrip() {
+        let cmd = ShellCommand::Execute {
+            command: "ls -la".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"execute\""));
+        let parsed: ShellCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn shell_event_output_roundtrip() {
+        let event = ShellEvent::Output {
+            stream: OutputStream::Stdout,
+            data: "hello\n".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ShellEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn shell_event_command_completed_roundtrip() {
+        let event = ShellEvent::CommandCompleted { exit_code: 42 };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ShellEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
     }
 }
