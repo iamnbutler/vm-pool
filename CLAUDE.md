@@ -7,11 +7,7 @@ A standalone service that manages a pool of isolated Linux VMs for running workl
 - `crates/` — Rust crates
   - `protocol/` — Shared command/event type definitions (VmId, VmCommand, VmEvent, ServiceCommand, ServiceEvent)
   - `supervisor/` — PID 1 binary that runs inside VMs, executes shell commands
-  - `transport/` — Host ↔ VM stdio communication (VmTransport + MockTransport)
-  - `events/` — Append-only event log with pub/sub and per-VM circular log buffers
-  - `images/` — Image types, versioning, filesystem-backed metadata store
-  - `pool/` — VM allocation, limits, health monitoring with timeout enforcement
-  - `snapshot/` — Save/restore VM state metadata (Virtualization.framework integration pending)
+  - `pool/` — VM allocation, limits, health monitoring; includes transport, events, images, snapshot modules
   - `service/` — Main binary + library, Unix socket API with configurable ServiceConfig
   - `client/` — High-level async client for communicating with the service
 - `images/` — Dockerfiles for each image type
@@ -58,7 +54,7 @@ cargo test --workspace               # run all tests
 
 ## Development Phases
 
-1. **Foundation** ✅ — Protocol types with VmId newtype, supervisor with real Execute, transport with MockTransport
+1. **Foundation** ✅ — Protocol types with VmId newtype, supervisor with real Execute, real process transport (no mocks)
 2. **Images** ✅ — Image types, versioning, filesystem-backed ImageStore
 3. **Pool** ✅ — VM lifecycle, allocation limits, health monitoring with timeout enforcement
 4. **Snapshots** ✅ — Metadata persistence (Virtualization.framework integration pending)
