@@ -1,11 +1,12 @@
-//! Supervisor — PID 1 process that runs inside VMs.
+//! Supervisor binary — shell execution supervisor for VMs.
 //!
-//! Receives commands over stdin (JSON lines), emits events to stdout.
+//! Uses [`ShellProtocol`]: receives `Execute` commands, emits `Output` and
+//! `CommandCompleted` events.
 
 use anyhow::Result;
-use vm_pool_protocol::{OutputStream, VmCommand, VmEvent};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{error, info};
+use tracing::info;
+use vm_pool_protocol::{OutputStream, ShellCommand, ShellEvent, ShellProtocol};
+use vm_pool_supervisor::run_supervisor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,107 +15,53 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!("supervisor starting");
+    info!("supervisor starting (shell protocol)");
 
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-
-    emit_event(&mut stdout, VmEvent::Ready).await?;
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            info!("stdin closed, shutting down");
-            break;
+    run_supervisor::<ShellProtocol, _, _>(|cmd| async move {
+        match cmd {
+            ShellCommand::Execute { command } => execute_command(&command).await,
         }
-
-        let command: VmCommand = match serde_json::from_str(line.trim()) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                error!("failed to parse command: {}", e);
-                continue;
-            }
-        };
-
-        match command {
-            VmCommand::Ping => {
-                emit_event(&mut stdout, VmEvent::Pong).await?;
-            }
-            VmCommand::Shutdown => {
-                info!("shutdown requested");
-                emit_event(&mut stdout, VmEvent::Shutdown).await?;
-                break;
-            }
-            VmCommand::Execute { command } => {
-                execute_command(&mut stdout, &command).await?;
-            }
-        }
-    }
-
-    info!("supervisor exiting");
-    Ok(())
+    })
+    .await
 }
 
-async fn execute_command(stdout: &mut tokio::io::Stdout, command: &str) -> Result<()> {
+async fn execute_command(command: &str) -> Vec<ShellEvent> {
     info!("executing: {}", command);
+    let mut events = Vec::new();
 
-    let output = tokio::process::Command::new("sh")
+    match tokio::process::Command::new("sh")
         .args(["-c", command])
         .output()
-        .await;
-
-    match output {
+        .await
+    {
         Ok(output) => {
             let stdout_data = String::from_utf8_lossy(&output.stdout);
             if !stdout_data.is_empty() {
-                emit_event(
-                    stdout,
-                    VmEvent::Output {
-                        stream: OutputStream::Stdout,
-                        data: stdout_data.into_owned(),
-                    },
-                )
-                .await?;
+                events.push(ShellEvent::Output {
+                    stream: OutputStream::Stdout,
+                    data: stdout_data.into_owned(),
+                });
             }
 
             let stderr_data = String::from_utf8_lossy(&output.stderr);
             if !stderr_data.is_empty() {
-                emit_event(
-                    stdout,
-                    VmEvent::Output {
-                        stream: OutputStream::Stderr,
-                        data: stderr_data.into_owned(),
-                    },
-                )
-                .await?;
+                events.push(ShellEvent::Output {
+                    stream: OutputStream::Stderr,
+                    data: stderr_data.into_owned(),
+                });
             }
 
             let exit_code = output.status.code().unwrap_or(-1);
-            emit_event(stdout, VmEvent::CommandCompleted { exit_code }).await?;
+            events.push(ShellEvent::CommandCompleted { exit_code });
         }
         Err(e) => {
-            emit_event(
-                stdout,
-                VmEvent::Output {
-                    stream: OutputStream::Stderr,
-                    data: format!("failed to execute command: {e}\n"),
-                },
-            )
-            .await?;
-            emit_event(stdout, VmEvent::CommandCompleted { exit_code: -1 }).await?;
+            events.push(ShellEvent::Output {
+                stream: OutputStream::Stderr,
+                data: format!("failed to execute command: {e}\n"),
+            });
+            events.push(ShellEvent::CommandCompleted { exit_code: -1 });
         }
     }
 
-    Ok(())
-}
-
-async fn emit_event(stdout: &mut tokio::io::Stdout, event: VmEvent) -> Result<()> {
-    let json = serde_json::to_string(&event)?;
-    stdout.write_all(json.as_bytes()).await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
-    Ok(())
+    events
 }

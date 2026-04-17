@@ -176,7 +176,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "supervisor emits ShellProtocol events only after Task 7"]
     async fn supervisor_ping_pong() {
         let binary = build_supervisor().await;
         let mut transport = VmTransport::<ShellProtocol>::spawn(binary.to_str().unwrap(), &[])
@@ -196,7 +195,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "supervisor emits ShellProtocol events only after Task 7"]
     async fn supervisor_execute_with_output() {
         let binary = build_supervisor().await;
         let mut transport = VmTransport::<ShellProtocol>::spawn(binary.to_str().unwrap(), &[])
@@ -238,7 +236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "supervisor emits ShellProtocol events only after Task 7"]
     async fn supervisor_execute_nonzero_exit() {
         let binary = build_supervisor().await;
         let mut transport = VmTransport::<ShellProtocol>::spawn(binary.to_str().unwrap(), &[])
