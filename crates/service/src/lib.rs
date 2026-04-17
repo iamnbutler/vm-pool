@@ -6,13 +6,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vm_pool_events::{EventLog, EventPayload, ServiceState};
-use vm_pool_manager::{Pool, PoolConfig};
-use vm_pool_protocol::{ServiceCommand, ServiceEvent};
-use vm_pool_snapshot::SnapshotStore;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info};
+use vm_pool_events::{EventLog, EventPayload, ServiceState};
+use vm_pool_manager::{NoRuntime, Pool, PoolConfig, VmRuntime};
+use vm_pool_protocol::{AppProtocol, NullProtocol, ServiceCommand, ServiceEvent};
+use vm_pool_snapshot::SnapshotStore;
 
 /// Configuration for the vm-pool service.
 #[derive(Debug, Clone)]
@@ -41,18 +41,38 @@ impl Default for ServiceConfig {
 }
 
 /// Shared state for all connection handlers.
-pub struct Service {
-    pub pool: Arc<Pool>,
-    pub events: Arc<EventLog>,
+pub struct Service<R = NoRuntime, P: AppProtocol = NullProtocol>
+where
+    R: VmRuntime<P>,
+{
+    pub pool: Arc<Pool<R, P>>,
+    pub events: Arc<EventLog<P>>,
     pub snapshots: SnapshotStore,
     pub config: ServiceConfig,
 }
 
-impl Service {
-    /// Create a new service with the given configuration.
+impl<P: AppProtocol> Service<NoRuntime, P> {
+    /// Create a new service with the given configuration (no VM runtime backend).
     pub async fn new(config: ServiceConfig) -> anyhow::Result<Arc<Self>> {
-        let events = EventLog::new();
+        let events = EventLog::<P>::new();
         let pool = Pool::new(config.pool.clone(), events.clone());
+        let snapshots = SnapshotStore::new(&config.snapshot_dir);
+        snapshots.init().await?;
+
+        Ok(Arc::new(Self {
+            pool,
+            events,
+            snapshots,
+            config,
+        }))
+    }
+}
+
+impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
+    /// Create a new service with a specific runtime backend.
+    pub async fn with_runtime(config: ServiceConfig, runtime: R) -> anyhow::Result<Arc<Self>> {
+        let events = EventLog::<P>::new();
+        let pool = Pool::with_runtime(config.pool.clone(), events.clone(), runtime);
         let snapshots = SnapshotStore::new(&config.snapshot_dir);
         snapshots.init().await?;
 
@@ -118,24 +138,24 @@ impl Service {
         let mut reader = BufReader::new(reader);
 
         let mut event_rx = self.events.subscribe();
-        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<ServiceEvent>(64);
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<ServiceEvent<P>>(64);
 
-        // Forward VM protocol events to client
+        // Forward VM application events to client
         let response_tx_for_events = response_tx.clone();
         tokio::spawn(async move {
             while let Ok(event) = event_rx.recv().await {
-                if let Some(vm_id) = &event.vm_id {
-                    if let EventPayload::VmProtocol {
-                        event: vm_event, ..
-                    } = event.payload
-                    {
-                        let _ = response_tx_for_events
-                            .send(ServiceEvent::VmEvent {
-                                vm_id: vm_id.clone(),
-                                event: vm_event,
-                            })
-                            .await;
-                    }
+                if let EventPayload::VmApp {
+                    vm_id,
+                    event: app_event,
+                } = event.payload
+                {
+                    let _ = response_tx_for_events
+                        .send(ServiceEvent::VmApp {
+                            vm_id,
+                            event: app_event,
+                        })
+                        .await;
                 }
             }
         });
@@ -162,7 +182,7 @@ impl Service {
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    let command: ServiceCommand = match serde_json::from_str(line.trim()) {
+                    let command: ServiceCommand<P> = match serde_json::from_str(line.trim()) {
                         Ok(cmd) => cmd,
                         Err(e) => {
                             error!("invalid command: {}", e);
@@ -188,7 +208,7 @@ impl Service {
 
     /// Handle a single command and return a response event.
     /// Public for direct testing without a socket.
-    pub async fn handle_command(&self, command: ServiceCommand) -> ServiceEvent {
+    pub async fn handle_command(&self, command: ServiceCommand<P>) -> ServiceEvent<P> {
         match command {
             ServiceCommand::Status => {
                 let status = self.pool.status().await;
@@ -219,13 +239,10 @@ impl Service {
             },
 
             ServiceCommand::Send { vm_id, command } => {
-                match self.pool.send_command(&vm_id, command).await {
+                match self.pool.send_to_vm(&vm_id, command).await {
                     Ok(()) => {
-                        // Command was forwarded; events will arrive via the event stream
-                        ServiceEvent::VmEvent {
-                            vm_id,
-                            event: vm_pool_protocol::VmEvent::Pong, // Ack
-                        }
+                        // Command was forwarded; events will arrive via the event stream.
+                        ServiceEvent::CommandSent { vm_id }
                     }
                     Err(e) => ServiceEvent::Error {
                         message: format!("send failed: {e}"),
@@ -289,9 +306,9 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vm_pool_protocol::{VmConfig, VmId};
+    use vm_pool_protocol::{ShellCommand, ShellProtocol, VmConfig, VmId};
 
-    async fn test_service() -> Arc<Service> {
+    async fn test_service() -> Arc<Service<NoRuntime, ShellProtocol>> {
         let dir = tempfile::tempdir().unwrap();
         let config = ServiceConfig {
             socket_path: dir.path().join("test.sock"),
@@ -304,7 +321,7 @@ mod tests {
         };
         // Leak the tempdir so it lives for the test
         std::mem::forget(dir);
-        Service::new(config).await.unwrap()
+        Service::<NoRuntime, ShellProtocol>::new(config).await.unwrap()
     }
 
     #[tokio::test]
@@ -385,7 +402,7 @@ mod tests {
             },
         };
         std::mem::forget(dir);
-        let svc = Service::new(config).await.unwrap();
+        let svc = Service::<NoRuntime, ShellProtocol>::new(config).await.unwrap();
 
         svc.handle_command(ServiceCommand::Allocate {
             image: "agent:v1".into(),
@@ -430,7 +447,9 @@ mod tests {
         let resp = svc
             .handle_command(ServiceCommand::Send {
                 vm_id: VmId::new("vm-nope"),
-                command: vm_pool_protocol::VmCommand::Ping,
+                command: ShellCommand::Execute {
+                    command: "test".into(),
+                },
             })
             .await;
         match resp {
