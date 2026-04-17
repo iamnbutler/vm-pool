@@ -36,8 +36,6 @@ opt-in).
 - [x] `VmTransport<P>` framing generic over the protocol's command/event types
 - [x] Supervisor becomes a library + binary. `run_supervisor<P, H, Fut>` handles infra messages; the binary specializes with `ShellProtocol`.
 
-See: `docs/superpowers/specs/2026-04-15-generic-protocol-design.md` and `docs/superpowers/plans/2026-04-15-generic-protocol.md`.
-
 ## Supervisor rework
 
 The supervisor currently just runs shell commands. It needs to become a real process manager.

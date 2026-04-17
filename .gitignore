@@ -24,3 +24,5 @@ Cargo.lock
 
 # Worktrees
 .worktrees/
+
+docs
