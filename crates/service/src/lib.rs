@@ -9,10 +9,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info};
-use vm_pool_events::{EventLog, EventPayload, ServiceState};
-use vm_pool_manager::{NoRuntime, Pool, PoolConfig, VmRuntime};
+use vm_pool_manager::{
+    EventLog, EventPayload, ImageRef, NoRuntime, Pool, PoolConfig, ServiceState, SnapshotStore,
+    VmRuntime,
+};
 use vm_pool_protocol::{AppProtocol, NullProtocol, ServiceCommand, ServiceEvent};
-use vm_pool_snapshot::SnapshotStore;
 
 /// Configuration for the vm-pool service.
 #[derive(Debug, Clone)]
@@ -220,8 +221,8 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
             }
 
             ServiceCommand::Allocate { image, config } => {
-                let image_ref = vm_pool_images::ImageRef::parse(&image)
-                    .unwrap_or_else(|| vm_pool_images::ImageRef::new(&image, "latest"));
+                let image_ref = ImageRef::parse(&image)
+                    .unwrap_or_else(|| ImageRef::new(&image, "latest"));
 
                 match self.pool.allocate(image_ref, config).await {
                     Ok(vm_id) => ServiceEvent::VmAllocated { vm_id, image },

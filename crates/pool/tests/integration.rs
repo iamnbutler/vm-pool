@@ -6,9 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vm_pool_events::{EventLog, EventPayload, VmState};
-use vm_pool_images::ImageRef;
-use vm_pool_manager::{Pool, PoolConfig, SupervisorRuntime};
+use vm_pool_manager::{EventLog, EventPayload, ImageRef, Pool, PoolConfig, SupervisorRuntime, VmState};
 use vm_pool_protocol::{Priority, ShellCommand, ShellEvent, ShellProtocol, VmConfig};
 
 /// Build the supervisor and return its path.
